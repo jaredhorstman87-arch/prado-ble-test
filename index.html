@@ -28,12 +28,14 @@
 <main>
   <h1>Prado Bluetooth test</h1>
   <p class="muted" id="support"></p>
+  <p class="muted">Test page v2</p>
 
   <section class="card">
     <div class="row">
       <button class="primary" id="connect" type="button">Connect</button>
       <button id="read" type="button" disabled>Read counter</button>
     </div>
+    <button id="connectAll" type="button">Connect (show all devices)</button>
     <p class="muted" id="status">Not connected.</p>
   </section>
 
@@ -56,7 +58,10 @@
 <script>
 (() => {
   // Veepeak OBDCheck BLE details confirmed with LightBlue.
-  const SERVICE = 0xfff0, WRITE_CHAR = 0xfff2, NOTIFY_CHAR = 0xfff1;
+  // Full 128-bit UUIDs: some iPhone browsers (Bluefy) don't accept the short 0xFFF0 form.
+  const uuid = (short) => '0000' + short + '-0000-1000-8000-00805f9b34fb';
+  const SERVICE = uuid('fff0'), WRITE_CHAR = uuid('fff2'), NOTIFY_CHAR = uuid('fff1');
+  const errText = (err) => (err && (err.message || err.name)) || String(err);
   const $ = (id) => document.getElementById(id);
   const enc = new TextEncoder(), dec = new TextDecoder();
   let writeChar = null, buffer = '', waiter = null;
@@ -69,7 +74,7 @@
 
   if (!navigator.bluetooth) {
     $('support').textContent = 'This browser has no Bluetooth access. On iPhone, open this page in the Bluefy app.';
-    $('connect').disabled = true;
+    $('connect').disabled = true; $('connectAll').disabled = true;
   } else {
     $('support').textContent = 'Ignition on, Veepeak plugged in, Car Scanner closed. Then tap Connect.';
   }
@@ -89,28 +94,39 @@
       buffer = '';
       const timer = setTimeout(() => { waiter = null; reject(new Error('No reply to ' + cmd)); }, ms);
       waiter = { resolve: (t) => { clearTimeout(timer); log('> ' + cmd + '\n' + t); resolve(t); } };
-      try { await writeChar.writeValue(enc.encode(cmd + '\r')); }
+      try {
+        const bytes = enc.encode(cmd + '\r');
+        if (writeChar.writeValueWithResponse) await writeChar.writeValueWithResponse(bytes);
+        else await writeChar.writeValue(bytes);
+      }
       catch (err) { clearTimeout(timer); waiter = null; reject(err); }
     });
   }
 
-  $('connect').onclick = async () => {
+  async function connect(showAll) {
+    let step = 'choosing the adapter';
     try {
       status('Choose VEEPEAK from the list…');
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: 'VEEPEAK' }, { services: [SERVICE] }],
-        optionalServices: [SERVICE]
-      });
+      log('Step: ' + step + (showAll ? ' (all devices)' : ''));
+      const device = await navigator.bluetooth.requestDevice(showAll
+        ? { acceptAllDevices: true, optionalServices: [SERVICE] }
+        : { filters: [{ namePrefix: 'VEEPEAK' }], optionalServices: [SERVICE] });
       log('Device: ' + (device.name || '(no name)'));
       device.addEventListener('gattserverdisconnected', () => { status('Disconnected.'); $('read').disabled = true; });
       status('Connecting…');
+      step = 'connecting'; log('Step: ' + step);
       const server = await device.gatt.connect();
+      step = 'finding service FFF0'; log('Step: ' + step);
       const service = await server.getPrimaryService(SERVICE);
+      step = 'finding FFF2 (write)'; log('Step: ' + step);
       writeChar = await service.getCharacteristic(WRITE_CHAR);
+      step = 'finding FFF1 (notify)'; log('Step: ' + step);
       const notifyChar = await service.getCharacteristic(NOTIFY_CHAR);
-      await notifyChar.startNotifications();
       notifyChar.addEventListener('characteristicvaluechanged', onData);
+      step = 'starting notifications'; log('Step: ' + step);
+      await notifyChar.startNotifications();
       status('Setting up the adapter…');
+      step = 'sending setup commands'; log('Step: ' + step);
       await send('ATZ', 8000);      // reset
       await send('ATE0');           // echo off
       await send('ATL0');           // no line feeds
@@ -121,10 +137,12 @@
       status('Connected. Tap Read counter.', true);
       $('read').disabled = false;
     } catch (err) {
-      log('Error: ' + err.message);
-      status(err.name === 'NotFoundError' ? 'No adapter chosen.' : 'Could not connect: ' + err.message);
+      log('Error while ' + step + ': ' + errText(err));
+      status(err && err.name === 'NotFoundError' ? 'No adapter chosen.' : 'Could not connect while ' + step + ': ' + errText(err));
     }
-  };
+  }
+  $('connect').onclick = () => connect(false);
+  $('connectAll').onclick = () => connect(true);
 
   let lastCounter = null;
   function showOdo() {
@@ -144,8 +162,8 @@
       showOdo();
       status('Read at ' + new Date().toLocaleTimeString('en-AU'), true);
     } catch (err) {
-      log('Error: ' + err.message);
-      status('Read failed: ' + err.message);
+      log('Error: ' + errText(err));
+      status('Read failed: ' + errText(err));
     }
   };
 })();
