@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prado BLE test</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f4f4f2; --card: #fff; --fg: #16181a; --muted: #5d6166; --line: #d6d8da; --accent: #d10f1e; --ok: #2f7a45; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0e0f10; --card: #17191b; --fg: #ececed; --muted: #a0a4aa; --line: #2b2e32; --accent: #e8202f; --ok: #5fbf78; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 16px 40px; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; display: grid; gap: 14px; }
+  h1 { margin: 0; font-size: 22px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 10px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  button { font: inherit; font-weight: 600; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); flex: 1; min-height: 44px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; }
+  label { font-size: 14px; color: var(--muted); display: grid; gap: 4px; }
+  input { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  .big { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .ok { color: var(--ok); }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 260px; overflow: auto; background: var(--bg); border-radius: 8px; padding: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Prado Bluetooth test</h1>
+  <p class="muted" id="support"></p>
+
+  <section class="card">
+    <div class="row">
+      <button class="primary" id="connect" type="button">Connect</button>
+      <button id="read" type="button" disabled>Read counter</button>
+    </div>
+    <p class="muted" id="status">Not connected.</p>
+  </section>
+
+  <section class="card">
+    <span class="muted">Distance since codes cleared</span>
+    <span class="big" id="counter">–</span>
+    <span class="muted">Odometer (offset + counter)</span>
+    <span class="big" id="odo">–</span>
+    <label>Offset (km)
+      <input id="offset" inputmode="numeric" value="195369">
+    </label>
+  </section>
+
+  <section class="card">
+    <span class="muted">Log (send this to Claude if anything looks wrong)</span>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+(() => {
+  // Veepeak OBDCheck BLE details confirmed with LightBlue.
+  const SERVICE = 0xfff0, WRITE_CHAR = 0xfff2, NOTIFY_CHAR = 0xfff1;
+  const $ = (id) => document.getElementById(id);
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  let writeChar = null, buffer = '', waiter = null;
+
+  const log = (line) => { $('log').textContent += line + '\n'; $('log').scrollTop = $('log').scrollHeight; };
+  const status = (t, ok) => { $('status').textContent = t; $('status').className = ok ? 'ok' : 'muted'; };
+
+  try { const saved = localStorage.getItem('prado-offset'); if (saved) $('offset').value = saved; } catch (e) {}
+  $('offset').addEventListener('change', () => { try { localStorage.setItem('prado-offset', $('offset').value); } catch (e) {} showOdo(); });
+
+  if (!navigator.bluetooth) {
+    $('support').textContent = 'This browser has no Bluetooth access. On iPhone, open this page in the Bluefy app.';
+    $('connect').disabled = true;
+  } else {
+    $('support').textContent = 'Ignition on, Veepeak plugged in, Car Scanner closed. Then tap Connect.';
+  }
+
+  // Replies from the adapter arrive in pieces; a reply is complete when the ">" prompt appears.
+  function onData(e) {
+    buffer += dec.decode(e.target.value);
+    if (buffer.includes('>') && waiter) {
+      const text = buffer.replace('>', '').trim();
+      buffer = '';
+      const w = waiter; waiter = null; w.resolve(text);
+    }
+  }
+
+  function send(cmd, ms = 5000) {
+    return new Promise(async (resolve, reject) => {
+      buffer = '';
+      const timer = setTimeout(() => { waiter = null; reject(new Error('No reply to ' + cmd)); }, ms);
+      waiter = { resolve: (t) => { clearTimeout(timer); log('> ' + cmd + '\n' + t); resolve(t); } };
+      try { await writeChar.writeValue(enc.encode(cmd + '\r')); }
+      catch (err) { clearTimeout(timer); waiter = null; reject(err); }
+    });
+  }
+
+  $('connect').onclick = async () => {
+    try {
+      status('Choose VEEPEAK from the list…');
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'VEEPEAK' }, { services: [SERVICE] }],
+        optionalServices: [SERVICE]
+      });
+      log('Device: ' + (device.name || '(no name)'));
+      device.addEventListener('gattserverdisconnected', () => { status('Disconnected.'); $('read').disabled = true; });
+      status('Connecting…');
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      writeChar = await service.getCharacteristic(WRITE_CHAR);
+      const notifyChar = await service.getCharacteristic(NOTIFY_CHAR);
+      await notifyChar.startNotifications();
+      notifyChar.addEventListener('characteristicvaluechanged', onData);
+      status('Setting up the adapter…');
+      await send('ATZ', 8000);      // reset
+      await send('ATE0');           // echo off
+      await send('ATL0');           // no line feeds
+      await send('ATS0');           // no spaces
+      await send('ATH0');           // no headers
+      await send('ATSP0');          // find the car's protocol automatically
+      await send('0100', 15000);    // first request also wakes the protocol search
+      status('Connected. Tap Read counter.', true);
+      $('read').disabled = false;
+    } catch (err) {
+      log('Error: ' + err.message);
+      status(err.name === 'NotFoundError' ? 'No adapter chosen.' : 'Could not connect: ' + err.message);
+    }
+  };
+
+  let lastCounter = null;
+  function showOdo() {
+    const off = parseInt(String($('offset').value).replace(/[^0-9]/g, ''), 10);
+    $('odo').textContent = lastCounter != null && off ? (off + lastCounter).toLocaleString('en-AU') + ' km' : '–';
+  }
+
+  $('read').onclick = async () => {
+    try {
+      status('Reading…');
+      const reply = (await send('0131', 8000)).replace(/\s/g, '').toUpperCase();
+      // Expected reply: 4131 followed by two bytes, e.g. 41312E69 → 0x2E69 = 11,881 km.
+      const m = reply.match(/4131([0-9A-F]{2})([0-9A-F]{2})/);
+      if (!m) { status('Unexpected reply: ' + reply); return; }
+      lastCounter = parseInt(m[1], 16) * 256 + parseInt(m[2], 16);
+      $('counter').textContent = lastCounter.toLocaleString('en-AU') + ' km';
+      showOdo();
+      status('Read at ' + new Date().toLocaleTimeString('en-AU'), true);
+    } catch (err) {
+      log('Error: ' + err.message);
+      status('Read failed: ' + err.message);
+    }
+  };
+})();
+</script>
+</body>
+</html>
